@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ERP Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 2rem; background: #f5f7fb; }
+    .card { background: #fff; border-radius: 10px; padding: 1.25rem; box-shadow: 0 2px 10px rgba(0,0,0,.08); max-width: 680px; }
+    .stats { display: flex; gap: 1rem; }
+    .tile { flex: 1; background: #eef3ff; padding: 1rem; border-radius: 8px; }
+    h1 { margin-top: 0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Python ERP (CI/CD Demo)</h1>
+    <p>Simple demo dashboard deployed via AWS CodePipeline.</p>
+    <div class="stats">
+      <div class="tile"><strong>Customers</strong><br>{{ customer_count }}</div>
+      <div class="tile"><strong>Orders</strong><br>{{ order_count }}</div>
+    </div>
+  </div>
+</body>
+</html>

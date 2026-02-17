@@ -1,0 +1,317 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  End-to-end CI/CD for Python ERP app using GitHub, CodePipeline, CodeBuild, CodeDeploy,
+  EC2 Auto Scaling, and RDS MySQL.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: erp-cicd
+  GitHubConnectionArn:
+    Type: String
+    Description: ARN of CodeStar connection to GitHub.
+  GitHubOwner:
+    Type: String
+    Description: GitHub username or org.
+  GitHubRepo:
+    Type: String
+    Description: Repository name.
+  GitHubBranch:
+    Type: String
+    Default: main
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet::Id
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet::Id
+  DBSubnet1:
+    Type: AWS::EC2::Subnet::Id
+  DBSubnet2:
+    Type: AWS::EC2::Subnet::Id
+  DBUsername:
+    Type: String
+    Default: erpadmin
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+
+Resources:
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ERP application SG
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          CidrIp: 0.0.0.0/0
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS SG for ERP
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for ERP database
+      SubnetIds:
+        - !Ref DBSubnet1
+        - !Ref DBSubnet2
+
+  ERPDatabase:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-mysql'
+      Engine: mysql
+      EngineVersion: '8.0.35'
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: '20'
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: !Ref DBPassword
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: codedeploy-ec2
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+                Resource: '*'
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2Role
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: ami-0f58b397bc5c1f2e8
+        InstanceType: t3.micro
+        IamInstanceProfile:
+          Arn: !GetAtt Ec2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y ruby wget
+            cd /home/ec2-user
+            wget https://aws-codedeploy-ap-south-1.s3.ap-south-1.amazonaws.com/latest/install
+            chmod +x ./install
+            ./install auto
+            systemctl enable codedeploy-agent
+            systemctl start codedeploy-agent
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      MinSize: '1'
+      MaxSize: '2'
+      DesiredCapacity: '1'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-app'
+          PropagateAtLaunch: true
+
+  CodeDeployServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+
+  CodeDeployApp:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub '${ProjectName}-app'
+      ComputePlatform: Server
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApp
+      DeploymentGroupName: !Sub '${ProjectName}-dg'
+      ServiceRoleArn: !GetAtt CodeDeployServiceRole.Arn
+      AutoScalingGroups:
+        - !Ref AppAutoScalingGroup
+      DeploymentStyle:
+        DeploymentOption: WITHOUT_TRAFFIC_CONTROL
+        DeploymentType: IN_PLACE
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: codebuild-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketAcl
+                  - s3:GetBucketLocation
+                Resource: '*'
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-build'
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        Type: LINUX_CONTAINER
+      Source:
+        Type: CODEPIPELINE
+      TimeoutInMinutes: 20
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pipeline-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: '*'
+                Resource: '*'
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-pipeline'
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: GitHubSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Sub '${GitHubOwner}/${GitHubRepo}'
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: BuildArtifact
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+        - Name: Deploy
+          Actions:
+            - Name: DeployToEC2
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CodeDeploy
+                Version: '1'
+              Configuration:
+                ApplicationName: !Ref CodeDeployApp
+                DeploymentGroupName: !Ref CodeDeployDeploymentGroup
+              InputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+  RDSHost:
+    Value: !GetAtt ERPDatabase.Endpoint.Address
+  AutoScalingGroupName:
+    Value: !Ref AppAutoScalingGroup
